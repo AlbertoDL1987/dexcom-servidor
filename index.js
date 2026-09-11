@@ -8,18 +8,19 @@ const PASSWORD = (process.env.DEXCOM_PASSWORD || '').trim();
 const BASE_URL = 'https://shareous1.dexcom.com/ShareWebServices/Services';
 const APP_ID = 'd89443d2-327c-4a6f-89e5-496bbb0317db';
 
-// Guardamos la sesión en memoria para no saturar a Dexcom
 let sesionGuardada = null;
 
+const HEADERS_DEXCOM = {
+  'Content-Type': 'application/json',
+  'Accept': 'application/json',
+  'User-Agent': 'Dexcom Share/3.0.2.11 CFNetwork/1408.0.4 Darwin/22.5.0',
+  'Connection': 'keep-alive'
+};
+
 async function iniciarSesion() {
-  // 1. Obtener AccountId
   const authRes = await fetch(`${BASE_URL}/General/AuthenticatePublisherAccountByName`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'User-Agent': 'Dexcom Share/3.0.2.11'
-    },
+    headers: HEADERS_DEXCOM,
     body: JSON.stringify({
       accountName: USERNAME,
       password: PASSWORD,
@@ -33,11 +34,7 @@ async function iniciarSesion() {
   if (accountId && accountId !== '00000000-0000-0000-0000-000000000000' && accountId.length > 10) {
     const loginRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountById`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'Dexcom Share/3.0.2.11'
-      },
+      headers: HEADERS_DEXCOM,
       body: JSON.stringify({
         accountId: accountId,
         password: PASSWORD,
@@ -53,14 +50,9 @@ async function iniciarSesion() {
     }
   }
 
-  // 2. Intento directo si falla el anterior
   const directRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountByName`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      'User-Agent': 'Dexcom Share/3.0.2.11'
-    },
+    headers: HEADERS_DEXCOM,
     body: JSON.stringify({
       accountName: USERNAME,
       password: PASSWORD,
@@ -72,7 +64,7 @@ async function iniciarSesion() {
   const sid = directText.replace(/"/g, '').trim();
 
   if (!sid || sid === '00000000-0000-0000-0000-000000000000' || sid.length < 10) {
-    throw new Error(`Credenciales rechazadas o bloqueo de Dexcom: ${directText}`);
+    throw new Error(`Credenciales o bloqueo de Dexcom: ${directText}`);
   }
 
   sesionGuardada = sid;
@@ -84,9 +76,8 @@ async function pedirLectura(sessionId) {
   const resp = await fetch(queryUrl, {
     method: 'POST',
     headers: {
-      'Accept': 'application/json',
-      'Content-Length': '0',
-      'User-Agent': 'Dexcom Share/3.0.2.11'
+      ...HEADERS_DEXCOM,
+      'Content-Length': '0'
     }
   });
 
@@ -96,20 +87,17 @@ async function pedirLectura(sessionId) {
 
 app.get('/glucosa', async (req, res) => {
   try {
-    // Si no tenemos sesión previa, iniciamos
     if (!sesionGuardada) {
       await iniciarSesion();
     }
 
     let resultado = await pedirLectura(sesionGuardada);
 
-    // Si la sesión expiró o devolvió error de autenticación, reintentamos login una vez
     if (resultado.body.includes('SessionIdNotFound') || resultado.body.includes('ArgumentException')) {
       await iniciarSesion();
       resultado = await pedirLectura(sesionGuardada);
     }
 
-    // Si Dexcom devuelve HTML (Cloudflare temporal)
     if (resultado.body.startsWith('<')) {
       return res.status(503).json({
         error: 'Dexcom está saturado temporalmente. Espera 2 minutos antes de recargar.',
@@ -123,8 +111,10 @@ app.get('/glucosa', async (req, res) => {
       const actual = lecturas[0];
       const match = actual.ST ? actual.ST.match(/\d+/) : null;
       const timestamp = match ? parseInt(match[0], 10) : Date.now();
+      const mmolCalculado = parseFloat((actual.Value / 18.018).toFixed(1));
 
       return res.json({
+        mmol: mmolCalculado,
         valor: actual.Value,
         tendencia: actual.Trend,
         hora: new Date(timestamp).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' })
@@ -133,7 +123,7 @@ app.get('/glucosa', async (req, res) => {
 
     return res.status(404).json({ error: 'No hay datos recientes disponibles' });
   } catch (err) {
-    sesionGuardada = null; // Reiniciar sesión ante error
+    sesionGuardada = null;
     return res.status(500).json({ error: err.message });
   }
 });
