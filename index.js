@@ -66,13 +66,13 @@ async function obtenerSessionId() {
   const directSessionId = directText.replace(/"/g, '').trim();
 
   if (!directSessionId || directSessionId === '00000000-0000-0000-0000-000000000000' || directSessionId.length < 10) {
-    throw new Error(`Credenciales rechazadas por Dexcom.`);
+    throw new Error('Credenciales rechazadas por Dexcom.');
   }
 
   return directSessionId;
 }
 
-// Endpoint de datos: devuelve las últimas 6 lecturas (últimos 30 minutos)
+// Endpoint JSON: devuelve el valor actual y las últimas 6 lecturas históricas
 app.get('/glucosa', async (req, res) => {
   try {
     const sessionId = await obtenerSessionId();
@@ -95,11 +95,11 @@ app.get('/glucosa', async (req, res) => {
         const match = item.ST ? item.ST.match(/\d+/) : null;
         const timestamp = match ? parseInt(match[0], 10) : Date.now();
         const mgdl = item.Value;
-        const mmol = (mgdl / 18.018).toFixed(1); // Conversión médica estándar a mmol/L
+        const mmol = parseFloat((mgdl / 18.018).toFixed(1));
 
         return {
           mgdl: mgdl,
-          mmol: parseFloat(mmol),
+          mmol: mmol,
           tendencia: item.Trend,
           hora: new Date(timestamp).toLocaleTimeString('de-DE', { 
             timeZone: 'Europe/Berlin', 
@@ -115,23 +115,21 @@ app.get('/glucosa', async (req, res) => {
       });
     }
 
-    return res.status(404).json({ error: 'No hay datos recientes disponibles' });
+    return res.status(404).json({ error: 'No hay datos disponibles' });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// Servir la aplicación web completa para iPhone
-app.get('/', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+// Interfaz para iPhone / Navegador
+const HTML_CONTENT = `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Glucosa Monitor">
+  <meta name="apple-mobile-web-app-title" content="Glucosa">
   <title>Glucosa Monitor</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -157,7 +155,7 @@ app.get('/', (req, res) => {
     .controles { background: #1e1e1e; border-radius: 14px; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
     .input-group { display: flex; justify-content: space-between; align-items: center; }
     input[type="number"] { width: 70px; background: #2a2a2a; border: none; color: #fff; padding: 6px 10px; border-radius: 8px; font-size: 16px; text-align: center; }
-    button { background: #007aff; color: #fff; border: none; padding: 12px; border-radius: 12px; font-weight: 600; font-size: 16px; margin-top: 5px; }
+    button { background: #007aff; color: #fff; border: none; padding: 12px; border-radius: 12px; font-weight: 600; font-size: 16px; cursor: pointer; margin-top: 5px; }
   </style>
 </head>
 <body>
@@ -195,8 +193,8 @@ app.get('/', (req, res) => {
   </div>
 
   <script>
-    let audioContext = null;
-    const flechas = {
+    var audioContext = null;
+    var flechas = {
       None: '→',
       DoubleUp: '⇈',
       SingleUp: '↑',
@@ -217,10 +215,10 @@ app.get('/', (req, res) => {
     function sonarAlarma() {
       if (!audioContext) return;
       try {
-        const osc = audioContext.createOscillator();
-        const gain = audioContext.createGain();
+        var osc = audioContext.createOscillator();
+        var gain = audioContext.createGain();
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, audioContext.currentTime); // Tono A5
+        osc.frequency.setValueAtTime(880, audioContext.currentTime);
         gain.gain.setValueAtTime(0.3, audioContext.currentTime);
         osc.connect(gain);
         gain.connect(audioContext.destination);
@@ -231,12 +229,12 @@ app.get('/', (req, res) => {
 
     async function actualizar() {
       try {
-        const res = await fetch('/glucosa');
-        const data = await res.json();
+        var res = await fetch('/glucosa');
+        var data = await res.json();
 
         if (data.actual) {
-          const actual = data.actual;
-          const historial = data.historial || [];
+          var actual = data.actual;
+          var historial = data.historial || [];
 
           document.getElementById('valorGlucosa').innerText = actual.mmol.toFixed(1);
           document.getElementById('horaLectura').innerText = actual.hora;
@@ -244,26 +242,29 @@ app.get('/', (req, res) => {
 
           // Comparación con el valor anterior
           if (historial.length > 1) {
-            const anterior = historial[1];
-            const diff = (actual.mmol - anterior.mmol).toFixed(1);
-            const signo = diff > 0 ? '+' : '';
-            document.getElementById('deltaValor').innerText = \`\${signo}\${diff} mmol/L vs anterior (\${anterior.hora})\`;
+            var anterior = historial[1];
+            var diff = (actual.mmol - anterior.mmol).toFixed(1);
+            var signo = diff > 0 ? '+' : '';
+            document.getElementById('deltaValor').innerText = signo + diff + ' mmol/L vs anterior (' + anterior.hora + ')';
           }
 
-          // Historial de filas
-          const lista = document.getElementById('listaHistorial');
-          lista.innerHTML = historial.map(h => \`
-            <div class="fila">
-              <span>\${h.hora}</span>
-              <span style="font-weight:600;">\${h.mmol.toFixed(1)} mmol/L (\${h.mgdl} mg/dL)</span>
-              <span>\${flechas[h.tendencia] || '→'}</span>
-            </div>
-          \`).join('');
+          // Lista de historial
+          var lista = document.getElementById('listaHistorial');
+          var filasHtml = '';
+          for (var i = 0; i < historial.length; i++) {
+            var h = historial[i];
+            filasHtml += '<div class="fila">' +
+              '<span>' + h.hora + '</span>' +
+              '<span style="font-weight:600;">' + h.mmol.toFixed(1) + ' mmol/L</span>' +
+              '<span>' + (flechas[h.tendencia] || '→') + '</span>' +
+            '</div>';
+          }
+          lista.innerHTML = filasHtml;
 
-          // Control de alarmas visuales
-          const bajo = parseFloat(document.getElementById('limiteBajo').value) || 4.2;
-          const alto = parseFloat(document.getElementById('limiteAlto').value) || 10.0;
-          const card = document.getElementById('cardPrincipal');
+          // Alarmas de color
+          var bajo = parseFloat(document.getElementById('limiteBajo').value) || 4.2;
+          var alto = parseFloat(document.getElementById('limiteAlto').value) || 10.0;
+          var card = document.getElementById('cardPrincipal');
 
           if (actual.mmol <= bajo) {
             card.className = 'card bg-alerta-baja';
@@ -281,11 +282,14 @@ app.get('/', (req, res) => {
     }
 
     actualizar();
-    setInterval(actualizar, 30000); // Consulta cada 30 segundos
+    setInterval(actualizar, 30000);
   </script>
 </body>
-</html>
-  `);
+</html>`;
+
+app.get('/', (req, res) => {
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(HTML_CONTENT);
 });
 
 app.listen(port, () => {
