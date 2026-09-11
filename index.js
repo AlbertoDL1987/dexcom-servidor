@@ -8,8 +8,11 @@ const PASSWORD = (process.env.DEXCOM_PASSWORD || '').trim();
 const BASE_URL = 'https://shareous1.dexcom.com/ShareWebServices/Services';
 const APP_ID = 'd89443d2-327c-4a6f-89e5-496bbb0317db';
 
-async function obtenerSessionId() {
-  // 1. AuthenticatePublisherAccountByName
+// Guardamos la sesión en memoria para no saturar a Dexcom
+let sesionGuardada = null;
+
+async function iniciarSesion() {
+  // 1. Obtener AccountId
   const authRes = await fetch(`${BASE_URL}/General/AuthenticatePublisherAccountByName`, {
     method: 'POST',
     headers: {
@@ -43,13 +46,14 @@ async function obtenerSessionId() {
     });
 
     const sessText = await loginRes.text();
-    const sessionId = sessText.replace(/"/g, '').trim();
-    if (sessionId && sessionId !== '00000000-0000-0000-0000-000000000000') {
-      return sessionId;
+    const sid = sessText.replace(/"/g, '').trim();
+    if (sid && sid !== '00000000-0000-0000-0000-000000000000') {
+      sesionGuardada = sid;
+      return sid;
     }
   }
 
-  // 2. Intento directo por si falla el anterior
+  // 2. Intento directo si falla el anterior
   const directRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountByName`, {
     method: 'POST',
     headers: {
@@ -65,40 +69,55 @@ async function obtenerSessionId() {
   });
 
   const directText = await directRes.text();
-  const directSessionId = directText.replace(/"/g, '').trim();
+  const sid = directText.replace(/"/g, '').trim();
 
-  if (!directSessionId || directSessionId === '00000000-0000-0000-0000-000000000000' || directSessionId.length < 10) {
-    throw new Error(`Credenciales rechazadas por Dexcom: ${accountIdRaw || directText}`);
+  if (!sid || sid === '00000000-0000-0000-0000-000000000000' || sid.length < 10) {
+    throw new Error(`Credenciales rechazadas o bloqueo de Dexcom: ${directText}`);
   }
 
-  return directSessionId;
+  sesionGuardada = sid;
+  return sid;
+}
+
+async function pedirLectura(sessionId) {
+  const queryUrl = `${BASE_URL}/Publisher/ReadPublisherLatestGlucoseValues?sessionId=${sessionId}&minutes=1440&maxCount=1`;
+  const resp = await fetch(queryUrl, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Length': '0',
+      'User-Agent': 'Dexcom Share/3.0.2.11'
+    }
+  });
+
+  const body = await resp.text();
+  return { status: resp.status, body: body };
 }
 
 app.get('/glucosa', async (req, res) => {
   try {
-    const sessionId = await obtenerSessionId();
+    // Si no tenemos sesión previa, iniciamos
+    if (!sesionGuardada) {
+      await iniciarSesion();
+    }
 
-    const queryUrl = `${BASE_URL}/Publisher/ReadPublisherLatestGlucoseValues?sessionId=${sessionId}&minutes=1440&maxCount=1`;
-    const resp = await fetch(queryUrl, {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/json',
-        'Content-Length': '0',
-        'User-Agent': 'Dexcom Share/3.0.2.11'
-      }
-    });
+    let resultado = await pedirLectura(sesionGuardada);
 
-    const bodyTexto = await resp.text();
+    // Si la sesión expiró o devolvió error de autenticación, reintentamos login una vez
+    if (resultado.body.includes('SessionIdNotFound') || resultado.body.includes('ArgumentException')) {
+      await iniciarSesion();
+      resultado = await pedirLectura(sesionGuardada);
+    }
 
-    // Si Dexcom devolvió HTML en lugar de JSON
-    if (bodyTexto.startsWith('<')) {
-      return res.status(502).json({ 
-        error: 'Dexcom devolvió un error de servidor temporal (HTML)', 
-        detalle: bodyTexto.substring(0, 100) 
+    // Si Dexcom devuelve HTML (Cloudflare temporal)
+    if (resultado.body.startsWith('<')) {
+      return res.status(503).json({
+        error: 'Dexcom está saturado temporalmente. Espera 2 minutos antes de recargar.',
+        detalle: 'Cloudflare rate limit'
       });
     }
 
-    const lecturas = JSON.parse(bodyTexto);
+    const lecturas = JSON.parse(resultado.body);
 
     if (Array.isArray(lecturas) && lecturas.length > 0) {
       const actual = lecturas[0];
@@ -114,6 +133,7 @@ app.get('/glucosa', async (req, res) => {
 
     return res.status(404).json({ error: 'No hay datos recientes disponibles' });
   } catch (err) {
+    sesionGuardada = null; // Reiniciar sesión ante error
     return res.status(500).json({ error: err.message });
   }
 });
