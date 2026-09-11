@@ -3,9 +3,110 @@ import express from 'express';
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Credenciales inyectadas de Render
 const USERNAME = (process.env.DEXCOM_USERNAME || '').trim();
 const PASSWORD = (process.env.DEXCOM_PASSWORD || '').trim();
+const BASE_URL = 'https://shareous1.dexcom.com/ShareWebServices/Services';
+const APP_ID = 'd89443d2-327c-4a6f-89e5-496bbb0317db';
+
+let sesionActiva = null;
+
+const HEADERS_DEXCOM = {
+  'Content-Type': 'application/json',
+  'Accept': 'application/json',
+  'User-Agent': 'Dexcom Share/3.0.2.11 CFNetwork/1408.0.4 Darwin/22.5.0'
+};
+
+async function obtenerSessionId() {
+  const authRes = await fetch(`${BASE_URL}/General/AuthenticatePublisherAccountByName`, {
+    method: 'POST',
+    headers: HEADERS_DEXCOM,
+    body: JSON.stringify({
+      accountName: USERNAME,
+      password: PASSWORD,
+      applicationId: APP_ID
+    })
+  });
+
+  const accId = (await authRes.text()).replace(/"/g, '').trim();
+
+  if (accId && accId !== '00000000-0000-0000-0000-000000000000' && accId.length > 10) {
+    const loginRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountById`, {
+      method: 'POST',
+      headers: HEADERS_DEXCOM,
+      body: JSON.stringify({
+        accountId: accId,
+        password: PASSWORD,
+        applicationId: APP_ID
+      })
+    });
+
+    const sid = (await loginRes.text()).replace(/"/g, '').trim();
+    if (sid && sid !== '00000000-0000-0000-0000-000000000000') {
+      sesionActiva = sid;
+      return sid;
+    }
+  }
+
+  const directRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountByName`, {
+    method: 'POST',
+    headers: HEADERS_DEXCOM,
+    body: JSON.stringify({
+      accountName: USERNAME,
+      password: PASSWORD,
+      applicationId: APP_ID
+    })
+  });
+
+  const directSid = (await directRes.text()).replace(/"/g, '').trim();
+  sesionActiva = directSid;
+  return directSid;
+}
+
+app.get('/datos', async (req, res) => {
+  try {
+    if (!sesionActiva) await obtenerSessionId();
+
+    const url = `${BASE_URL}/Publisher/ReadPublisherLatestGlucoseValues?sessionId=${sesionActiva}&minutes=1440&maxCount=1`;
+    let resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Length': '0',
+        'User-Agent': 'Dexcom Share/3.0.2.11 CFNetwork/1408.0.4 Darwin/22.5.0'
+      }
+    });
+
+    let texto = await resp.text();
+
+    if (texto.includes('SessionIdNotFound') || texto.includes('ArgumentException')) {
+      await obtenerSessionId();
+      resp = await fetch(`${BASE_URL}/Publisher/ReadPublisherLatestGlucoseValues?sessionId=${sesionActiva}&minutes=1440&maxCount=1`, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Length': '0', 'User-Agent': 'Dexcom Share/3.0.2.11 CFNetwork/1408.0.4 Darwin/22.5.0' }
+      });
+      texto = await resp.text();
+    }
+
+    const data = JSON.parse(texto);
+    if (Array.isArray(data) && data.length > 0) {
+      const item = data[0];
+      const match = item.ST ? item.ST.match(/\d+/) : null;
+      const ts = match ? parseInt(match[0], 10) : Date.now();
+      const mmol = parseFloat((item.Value / 18.018).toFixed(1));
+
+      return res.json({
+        mmol: mmol,
+        tendencia: item.Trend,
+        hora: new Date(ts).toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin', hour: '2-digit', minute: '2-digit' })
+      });
+    }
+
+    return res.status(404).json({ error: 'Sin datos disponibles' });
+  } catch (err) {
+    sesionActiva = null;
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 const HTML_APP = `<!DOCTYPE html>
 <html lang="es">
@@ -18,241 +119,111 @@ const HTML_APP = `<!DOCTYPE html>
   <title>Glucosa Monitor</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: #121212; color: #fff; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 20px; text-align: center; }
-    .card { background: #1e1e1e; border-radius: 20px; padding: 25px; width: 100%; max-width: 360px; margin-top: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); transition: background 0.3s; }
-    .valor { font-size: 72px; font-weight: 800; line-height: 1; margin: 10px 0; }
-    .unidad { font-size: 18px; color: #888; }
-    .tendencia { font-size: 34px; margin-top: 5px; }
-    .hora { font-size: 14px; color: #aaa; }
-    .diferencia { font-size: 15px; margin-top: 12px; font-weight: 600; color: #4dabf7; }
-    .bg-alerta-baja { background-color: #8b0000 !important; }
-    .bg-alerta-alta { background-color: #b8860b !important; }
-    .bg-normal { background-color: #1e1e1e !important; }
-    
-    .seccion { width: 100%; max-width: 360px; margin-top: 20px; text-align: left; }
-    h3 { font-size: 13px; text-transform: uppercase; letter-spacing: 1px; color: #777; margin-bottom: 8px; }
-    
-    .lista { background: #1e1e1e; border-radius: 14px; padding: 10px 15px; }
-    .fila { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #2a2a2a; font-size: 14px; }
-    .fila:last-child { border-bottom: none; }
-    
-    .controles { background: #1e1e1e; border-radius: 14px; padding: 15px; display: flex; flex-direction: column; gap: 10px; }
-    .input-group { display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
-    input[type="number"] { width: 75px; background: #2a2a2a; border: none; color: #fff; padding: 6px 10px; border-radius: 8px; font-size: 16px; text-align: center; }
-    button { background: #007aff; color: #fff; border: none; padding: 12px; border-radius: 12px; font-weight: 600; font-size: 15px; cursor: pointer; margin-top: 5px; }
+    body { background-color: #121212; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; text-align: center; }
+    .card { background: #1e1e1e; border-radius: 28px; padding: 35px 25px; width: 100%; max-width: 340px; box-shadow: 0 8px 30px rgba(0,0,0,0.6); transition: background 0.3s; }
+    .hora { font-size: 15px; color: #888; font-weight: 500; }
+    .valor { font-size: 82px; font-weight: 800; line-height: 1.1; margin: 15px 0 5px 0; }
+    .unidad { font-size: 20px; color: #888; }
+    .tendencia { font-size: 44px; margin: 8px 0; }
+    .diferencia { font-size: 16px; font-weight: 600; color: #4dabf7; min-height: 24px; }
+    .bg-baja { background-color: #8b0000 !important; }
+    .bg-alta { background-color: #b8860b !important; }
+    .controles { width: 100%; max-width: 340px; margin-top: 25px; background: #1e1e1e; border-radius: 18px; padding: 18px; }
+    .fila { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; font-size: 15px; }
+    input { width: 75px; background: #2a2a2a; border: none; color: #fff; padding: 8px; border-radius: 8px; font-size: 16px; text-align: center; }
+    button { width: 100%; background: #007aff; color: #fff; border: none; padding: 12px; border-radius: 12px; font-weight: 600; font-size: 16px; cursor: pointer; }
   </style>
 </head>
 <body>
-
-  <div class="card" id="cardPrincipal">
-    <div class="hora" id="horaLectura">Conectando...</div>
-    <div class="valor" id="valorGlucosa">--</div>
+  <div class="card" id="card">
+    <div class="hora" id="hora">Conectando...</div>
+    <div class="valor" id="valor">--</div>
     <div class="unidad">mmol/L</div>
-    <div class="tendencia" id="flechaTendencia"></div>
-    <div class="diferencia" id="deltaValor">Esperando lectura...</div>
+    <div class="tendencia" id="flecha"></div>
+    <div class="diferencia" id="diff">--</div>
   </div>
 
-  <div class="seccion">
-    <h3>Últimas 6 lecturas guardadas</h3>
-    <div class="lista" id="listaHistorial">
-      <div style="color:#666; font-size:13px; text-align:center;">Esperando datos...</div>
+  <div class="controles">
+    <div class="fila">
+      <label>Alarma baja (&le;):</label>
+      <input type="number" id="bajo" step="0.1" value="4.2">
     </div>
-  </div>
-
-  <div class="seccion">
-    <h3>Alarmas (mmol/L)</h3>
-    <div class="controles">
-      <div class="input-group">
-        <label>Alarma Baja (&le;):</label>
-        <input type="number" id="limiteBajo" step="0.1" value="4.2">
-      </div>
-      <div class="input-group">
-        <label>Alarma Alta (&ge;):</label>
-        <input type="number" id="limiteAlto" step="0.1" value="10.0">
-      </div>
-      <button onclick="activarSonido()">Activar Alarma Sonora</button>
+    <div class="fila">
+      <label>Alarma alta (&ge;):</label>
+      <input type="number" id="alto" step="0.1" value="10.0">
     </div>
+    <button onclick="activarAudio()">Activar sonido de alerta</button>
   </div>
 
   <script>
-    var audioContext = null;
-    var sessionId = null;
-    var APP_ID = 'd89443d2-327c-4a6f-89e5-496bbb0317db';
-    var USERNAME = "${USERNAME}";
-    var PASSWORD = "${PASSWORD}";
+    var audioCtx = null;
+    var flechas = { None:'→', DoubleUp:'⇈', SingleUp:'↑', FortyFiveUp:'↗', Flat:'→', FortyFiveDown:'↘', SingleDown:'↓', DoubleDown:'⇊' };
 
-    // Proxy para saltar la restricción CORS desde el navegador del móvil
-    var PROXY = 'https://corsproxy.io/?url=';
-    var BASE_DEXCOM = 'https://shareous1.dexcom.com/ShareWebServices/Services';
-
-    var flechas = {
-      None: '→',
-      DoubleUp: '⇈',
-      SingleUp: '↑',
-      FortyFiveUp: '↗',
-      Flat: '→',
-      FortyFiveDown: '↘',
-      SingleDown: '↓',
-      DoubleDown: '⇊'
-    };
-
-    function activarSonido() {
-      if (!audioContext) {
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      sonarAlarma();
+    function activarAudio() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      sonar();
     }
 
-    function sonarAlarma() {
-      if (!audioContext) return;
+    function sonar() {
+      if (!audioCtx) return;
       try {
-        var osc = audioContext.createOscillator();
-        var gain = audioContext.createGain();
+        var osc = audioCtx.createOscillator();
+        var g = audioCtx.createGain();
         osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, audioContext.currentTime);
-        gain.gain.setValueAtTime(0.3, audioContext.currentTime);
-        osc.connect(gain);
-        gain.connect(audioContext.destination);
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+        g.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        osc.connect(g);
+        g.connect(audioCtx.destination);
         osc.start();
-        osc.stop(audioContext.currentTime + 0.4);
-      } catch (e) {}
+        osc.stop(audioCtx.currentTime + 0.3);
+      } catch(e) {}
     }
 
-    async function loginDexcom() {
-      var target = encodeURIComponent(BASE_DEXCOM + '/General/LoginPublisherAccountByName');
-      var res = await fetch(PROXY + target, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          accountName: USERNAME,
-          password: PASSWORD,
-          applicationId: APP_ID
-        })
-      });
-
-      var text = await res.text();
-      var sid = text.replace(/"/g, '').trim();
-      if (!sid || sid === '00000000-0000-0000-0000-000000000000' || sid.length < 10) {
-        // Intento 2 con Authenticate si el directo falla
-        var authTarget = encodeURIComponent(BASE_DEXCOM + '/General/AuthenticatePublisherAccountByName');
-        var authRes = await fetch(PROXY + authTarget, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({ accountName: USERNAME, password: PASSWORD, applicationId: APP_ID })
-        });
-        var accId = (await authRes.text()).replace(/"/g, '').trim();
-
-        var loginByIdTarget = encodeURIComponent(BASE_DEXCOM + '/General/LoginPublisherAccountById');
-        var idRes = await fetch(PROXY + loginByIdTarget, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify({ accountId: accId, password: PASSWORD, applicationId: APP_ID })
-        });
-        sid = (await idRes.text()).replace(/"/g, '').trim();
-      }
-
-      sessionId = sid;
-      return sid;
-    }
-
-    async function obtenerGlucosa() {
+    async function cargar() {
       try {
-        if (!sessionId) {
-          await loginDexcom();
-        }
+        var r = await fetch('/datos');
+        var d = await r.json();
 
-        var readUrl = BASE_DEXCOM + '/Publisher/ReadPublisherLatestGlucoseValues?sessionId=' + sessionId + '&minutes=1440&maxCount=1';
-        var res = await fetch(PROXY + encodeURIComponent(readUrl), {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/json',
-            'Content-Length': '0'
-          }
-        });
+        if (d.mmol) {
+          document.getElementById('valor').innerText = d.mmol.toFixed(1);
+          document.getElementById('hora').innerText = d.hora;
+          document.getElementById('flecha').innerText = flechas[d.tendencia] || '→';
 
-        var text = await res.text();
+          // Recuperar lectura anterior para calcular la variación
+          var anterior = JSON.parse(localStorage.getItem('glucosa_anterior') || 'null');
 
-        // Si expiró la sesión, reintentar login
-        if (text.includes('SessionIdNotFound')) {
-          await loginDexcom();
-          return obtenerGlucosa();
-        }
-
-        var data = JSON.parse(text);
-        if (Array.isArray(data) && data.length > 0) {
-          var item = data[0];
-          var match = item.ST ? item.ST.match(/\d+/) : null;
-          var ts = match ? parseInt(match[0], 10) : Date.now();
-          var mmol = parseFloat((item.Value / 18.018).toFixed(1));
-          var hora = new Date(ts).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
-
-          var lecturaActual = {
-            mmol: mmol,
-            mgdl: item.Value,
-            tendencia: item.Trend,
-            hora: hora
-          };
-
-          // Mostrar valor grande
-          document.getElementById('valorGlucosa').innerText = mmol.toFixed(1);
-          document.getElementById('horaLectura').innerText = hora;
-          document.getElementById('flechaTendencia').innerText = flechas[item.Trend] || '→';
-
-          // Historial persistente en el navegador
-          var historial = JSON.parse(localStorage.getItem('glucosa_hist') || '[]');
-          if (historial.length === 0 || historial[0].hora !== hora) {
-            historial.unshift(lecturaActual);
-            if (historial.length > 6) historial = historial.slice(0, 6);
-            localStorage.setItem('glucosa_hist', JSON.stringify(historial));
-          }
-
-          // Comparación con el valor anterior
-          if (historial.length > 1) {
-            var anterior = historial[1];
-            var diff = (mmol - anterior.mmol).toFixed(1);
+          if (anterior && anterior.hora !== d.hora) {
+            var diff = (d.mmol - anterior.mmol).toFixed(1);
             var signo = diff > 0 ? '+' : '';
-            document.getElementById('deltaValor').innerText = signo + diff + ' mmol/L vs anterior (' + anterior.hora + ')';
-          } else {
-            document.getElementById('deltaValor').innerText = 'Primera lectura (sin anterior aún)';
+            document.getElementById('diff').innerText = signo + diff + ' mmol/L vs anterior (' + anterior.hora + ')';
+            localStorage.setItem('glucosa_anterior', JSON.stringify({ mmol: d.mmol, hora: d.hora }));
+          } else if (!anterior) {
+            document.getElementById('diff').innerText = 'Lectura inicial';
+            localStorage.setItem('glucosa_anterior', JSON.stringify({ mmol: d.mmol, hora: d.hora }));
           }
 
-          // Lista de historial
-          var lista = document.getElementById('listaHistorial');
-          var filas = '';
-          for (var i = 0; i < historial.length; i++) {
-            filas += '<div class="fila">' +
-              '<span>' + historial[i].hora + '</span>' +
-              '<span style="font-weight:600;">' + historial[i].mmol.toFixed(1) + ' mmol/L</span>' +
-              '<span>' + (flechas[historial[i].tendencia] || '→') + '</span>' +
-            '</div>';
-          }
-          lista.innerHTML = filas;
+          // Control de colores y aviso sonoro
+          var vBajo = parseFloat(document.getElementById('bajo').value) || 4.2;
+          var vAlto = parseFloat(document.getElementById('alto').value) || 10.0;
+          var c = document.getElementById('card');
 
-          // Alarma de colores
-          var bajo = parseFloat(document.getElementById('limiteBajo').value) || 4.2;
-          var alto = parseFloat(document.getElementById('limiteAlto').value) || 10.0;
-          var card = document.getElementById('cardPrincipal');
-
-          if (mmol <= bajo) {
-            card.className = 'card bg-alerta-baja';
-            sonarAlarma();
-          } else if (mmol >= alto) {
-            card.className = 'card bg-alerta-alta';
-            sonarAlarma();
+          if (d.mmol <= vBajo) {
+            c.className = 'card bg-baja';
+            sonar();
+          } else if (d.mmol >= vAlto) {
+            c.className = 'card bg-alta';
+            sonar();
           } else {
-            card.className = 'card bg-normal';
+            c.className = 'card';
           }
         }
-      } catch (e) {
-        document.getElementById('horaLectura').innerText = 'Reconectando con Dexcom...';
+      } catch (err) {
+        document.getElementById('hora').innerText = 'Reintentando...';
       }
     }
 
-    obtenerGlucosa();
-    setInterval(obtenerGlucosa, 30000); // Actualiza cada 30 segundos
+    cargar();
+    setInterval(cargar, 30000);
   </script>
 </body>
 </html>`;
@@ -262,6 +233,4 @@ app.get('/', (req, res) => {
   res.send(HTML_APP);
 });
 
-app.listen(port, () => {
-  console.log(`Servidor activo en puerto ${port}`);
-});
+app.listen(port, () => console.log('Servidor en ejecución'));
