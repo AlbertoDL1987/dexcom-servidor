@@ -8,6 +8,6 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "dexcom-share": "^1.2.0"
+    "dexcom-share": "*"
   }
 }
