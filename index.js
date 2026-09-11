@@ -9,7 +9,7 @@ const BASE_URL = 'https://shareous1.dexcom.com/ShareWebServices/Services';
 const APP_ID = 'd89443d2-327c-4a6f-89e5-496bbb0317db';
 
 async function obtenerSessionId() {
-  // Intento 1: Obtener AccountId primero (protocolo europeo estándar)
+  // 1. AuthenticatePublisherAccountByName
   const authRes = await fetch(`${BASE_URL}/General/AuthenticatePublisherAccountByName`, {
     method: 'POST',
     headers: {
@@ -27,7 +27,6 @@ async function obtenerSessionId() {
   const accountIdRaw = await authRes.text();
   const accountId = accountIdRaw.replace(/"/g, '').trim();
 
-  // Si Authenticate devuelve un ID válido
   if (accountId && accountId !== '00000000-0000-0000-0000-000000000000' && accountId.length > 10) {
     const loginRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountById`, {
       method: 'POST',
@@ -50,7 +49,7 @@ async function obtenerSessionId() {
     }
   }
 
-  // Intento 2: Login directo
+  // 2. Intento directo por si falla el anterior
   const directRes = await fetch(`${BASE_URL}/General/LoginPublisherAccountByName`, {
     method: 'POST',
     headers: {
@@ -69,7 +68,7 @@ async function obtenerSessionId() {
   const directSessionId = directText.replace(/"/g, '').trim();
 
   if (!directSessionId || directSessionId === '00000000-0000-0000-0000-000000000000' || directSessionId.length < 10) {
-    throw new Error(`Credenciales rechazadas por Dexcom (Respuesta: ${accountIdRaw || directText}). Verifica el usuario/contraseña en Render.`);
+    throw new Error(`Credenciales rechazadas por Dexcom: ${accountIdRaw || directText}`);
   }
 
   return directSessionId;
@@ -90,6 +89,15 @@ app.get('/glucosa', async (req, res) => {
     });
 
     const bodyTexto = await resp.text();
+
+    // Si Dexcom devolvió HTML en lugar de JSON
+    if (bodyTexto.startsWith('<')) {
+      return res.status(502).json({ 
+        error: 'Dexcom devolvió un error de servidor temporal (HTML)', 
+        detalle: bodyTexto.substring(0, 100) 
+      });
+    }
+
     const lecturas = JSON.parse(bodyTexto);
 
     if (Array.isArray(lecturas) && lecturas.length > 0) {
